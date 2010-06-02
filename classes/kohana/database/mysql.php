@@ -1,15 +1,10 @@
 <?php defined('SYSPATH') or die('No direct script access.');
 /**
- * MySQL database connection.
+ * AirPOS MySQL database connection.
  *
- * @package    Kohana/Database
- * @category   Drivers
- * @author     Kohana Team
- * @copyright  (c) 2008-2009 Kohana Team
- * @license    http://kohanaphp.com/license
  */
-class Kohana_Database_MySQL extends Database {
-
+class Kohana_Database_MySQL extends Database
+{
 	// Database in use by each connection
 	protected static $_current_databases = array();
 
@@ -21,11 +16,29 @@ class Kohana_Database_MySQL extends Database {
 
 	// MySQL uses a backtick for identifiers
 	protected $_identifier = '`';
+	
+	protected $_db_master;
+	protected $_db_master_connection_id;
+	
+	protected $_db_slave;
+	protected $_db_slave_connection_id;
 
-	public function connect()
+	public function connect($master = FALSE)
 	{
-		if ($this->_connection)
+		// Check if a connection to a master or slave connection
+		// has already been made and return it.
+		if ($master === TRUE AND is_resource($this->_db_master))
+		{
+			$this->_connection = $this->_db_master;
+			$this->_connection_id = $this->_db_master_connection_id;
 			return;
+		}
+		elseif ($master === FALSE AND is_resource($this->_db_slave))
+		{
+			$this->_connection = $this->_db_slave;
+			$this->_connection_id = $this->_db_slave_connection_id;
+			return;
+		}
 
 		if (Database_MySQL::$_set_names === NULL)
 		{
@@ -44,9 +57,22 @@ class Kohana_Database_MySQL extends Database {
 			'password'   => '',
 			'persistent' => FALSE,
 		));
-
+		
+		// Pick a database from the master pool
+		if ($master === TRUE)
+		{
+			$index = array_rand($hostname['master']);
+			$hostname = $hostname['master'][$index];
+		}
+		// Pick a database from the slave pool
+		else
+		{
+			$index = array_rand($hostname['slave']);
+			$hostname = $hostname['slave'][$index];
+		}
+		
 		// Prevent this information from showing up in traces
-		unset($this->_config['connection']['username'], $this->_config['connection']['password']);
+		// unset($this->_config['connection']['username'], $this->_config['connection']['password']);
 
 		try
 		{
@@ -60,17 +86,31 @@ class Kohana_Database_MySQL extends Database {
 				// Create a persistent connection
 				$this->_connection = mysql_pconnect($hostname, $username, $password);
 			}
+			
+			// Set the master connection
+			if ($master === TRUE)
+				$this->_db_master = $this->_connection;
+			else
+				$this->_db_slave = $this->_connection;
 		}
 		catch (ErrorException $e)
 		{
 			// No connection exists
-			$this->_connection = NULL;
-
+			$this->_connection = $this->_db_master = $this->_db_slave = NULL;
 			throw $e;
 		}
 
 		// \xFF is a better delimiter, but the PHP driver uses underscore
 		$this->_connection_id = sha1($hostname.'_'.$username.'_'.$password);
+		
+		if ($master === TRUE)
+		{
+			$this->_db_master_connection_id = $this->_connection_id;
+		}
+		else
+		{
+			$this->_db_slave_connection_id = $this->_connection_id;
+		}
 
 		$this->_select_db($database);
 
@@ -111,11 +151,23 @@ class Kohana_Database_MySQL extends Database {
 			{
 				$status = mysql_close($this->_connection);
 			}
+			
+			if (is_resource($this->_db_master))
+			{
+				$status = mysql_close($this->_db_master);
+			}
+			
+			if (is_resource($this->_db_slave))
+			{
+				$status = mysql_close($this->_db_slave);
+			}
 		}
 		catch (Exception $e)
 		{
 			// Database is probably not disconnected
 			$status = ! is_resource($this->_connection);
+			$status = ! is_resource($this->_db_master);
+			$status = ! is_resource($this->_db_slave);
 		}
 
 		return $status;
@@ -124,7 +176,7 @@ class Kohana_Database_MySQL extends Database {
 	public function set_charset($charset)
 	{
 		// Make sure the database is connected
-		$this->_connection or $this->connect();
+		$this->_connection or $this->connect(TRUE);
 
 		if (Database_MySQL::$_set_names === TRUE)
 		{
@@ -147,15 +199,29 @@ class Kohana_Database_MySQL extends Database {
 
 	public function query($type, $sql, $as_object)
 	{
-		// Make sure the database is connected
-		$this->_connection or $this->connect();
-
+		switch ($type)
+		{
+			default :
+			case NULL :
+			case Database::INSERT :
+			case Database::UPDATE :
+			case Database::DELETE :
+				// Make sure we are connecting to a master database
+				($this->_connection AND $this->_connection === $this->_db_master) OR $this->connect(TRUE);
+			break;
+			
+			case Database::SELECT :
+				// Make sure we are connecting to a slave
+				($this->_connection AND $this->_connection === $this->_db_slave) OR $this->connect(FALSE);
+			break;
+		}
+		
 		if ( ! empty($this->_config['profiling']))
 		{
 			// Benchmark this query for the current instance
 			$benchmark = Profiler::start("Database ({$this->_instance})", $sql);
 		}
-
+		
 		if ( ! empty($this->_config['connection']['persistent']) AND $this->_config['connection']['database'] !== Database_MySQL::$_current_databases[$this->_connection_id])
 		{
 			// Select database on persistent connections
@@ -353,7 +419,7 @@ class Kohana_Database_MySQL extends Database {
 	public function escape($value)
 	{
 		// Make sure the database is connected
-		$this->_connection or $this->connect();
+		$this->_connection or $this->connect(TRUE);
 
 		if (($value = mysql_real_escape_string((string) $value, $this->_connection)) === FALSE)
 		{
